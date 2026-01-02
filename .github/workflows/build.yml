@@ -9,7 +9,7 @@ on:
 permissions:
     contents: read
     packages: write
-    id-token: write # Required for SLSA provenance
+    id-token: write
 
 env:
     REGISTRY: ghcr.io
@@ -41,11 +41,13 @@ jobs:
               with:
                   images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
                   tags: |
-                      type=ref,event=branch
-                      type=ref,event=pr
                       type=semver,pattern={{version}}
                       type=semver,pattern={{major}}.{{minor}}
-                      type=sha,prefix={{branch}}-
+                      type=semver,pattern={{major}}
+                      type=ref,event=branch
+                      type=sha,prefix=sha-,enable=${{ github.ref_type == 'branch' }}
+                  flavor: |
+                      latest=auto
 
             - name: Build and push Docker image
               id: build
@@ -59,6 +61,17 @@ jobs:
                   cache-from: type=gha
                   cache-to: type=gha,mode=max
 
+            - name: Display image information
+              run: |
+                  echo "### Docker Image Built Successfully! 🎉" >> $GITHUB_STEP_SUMMARY
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "**Digest:** \`${{ steps.build.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "**Tags:**" >> $GITHUB_STEP_SUMMARY
+                  echo '```' >>  $ GITHUB_STEP_SUMMARY
+                  echo " $ {{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+                  echo '```' >> $GITHUB_STEP_SUMMARY
+
     provenance:
         needs: [build]
         permissions:
@@ -67,7 +80,7 @@ jobs:
             packages: write
         uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v1.10.0
         with:
-            image: ${{ needs.build.outputs.registry }}/${{ needs.build.outputs.image-name }}
+            image: ghcr.io/${{ github.repository }}
             digest: ${{ needs.build.outputs.image-digest }}
             registry-username: ${{ github.actor }}
         secrets:
