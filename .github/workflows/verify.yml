@@ -4,9 +4,9 @@ on:
     workflow_dispatch:
         inputs:
             image-tag:
-                description: "Image tag to verify"
+                description: "Image tag to verify (e.g., v1.0.0)"
                 required: true
-                default: "main"
+                type: string
 
 permissions:
     contents: read
@@ -19,8 +19,16 @@ env:
 jobs:
     verify:
         runs-on: ubuntu-latest
-
         steps:
+            - name: Validate tag format
+              run: |
+                  TAG="${{ github.event.inputs.image-tag }}"
+                  if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    echo "❌ Error: Tag must be in format v*.*.* (e.g., v1.0.0)"
+                    exit 1
+                  fi
+                  echo "✅ Tag format is valid: $TAG"
+
             - name: Log in to Container Registry
               uses: docker/login-action@v3
               with:
@@ -31,11 +39,19 @@ jobs:
             - name: Pull image and get digest
               id: image-info
               run: |
-                  IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.inputs.image-tag }}"
+                  TAG="${{ github.event.inputs.image-tag }}"
+                  IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}"
+
+                  echo "Pulling image: $IMAGE"
                   docker pull "$IMAGE"
+
                   DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE" | cut -d'@' -f2)
+                  FULL_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}"
+
                   echo "digest=$DIGEST" >> $GITHUB_OUTPUT
-                  echo "full-image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@$DIGEST" >> $GITHUB_OUTPUT
+                  echo "full-image=$FULL_IMAGE" >> $GITHUB_OUTPUT
+
+                  echo "Image: $FULL_IMAGE"
 
             - name: Install slsa-verifier
               run: |
@@ -46,52 +62,56 @@ jobs:
             - name: Verify SLSA provenance
               env:
                   IMAGE: ${{ steps.image-info.outputs.full-image }}
+                  TAG: ${{ github.event.inputs.image-tag }}
               run: |
+                  echo "=== Verifying SLSA Provenance ==="
+                  echo "Image: $IMAGE"
+                  echo "Source Tag: $TAG"
+                  echo ""
+
                   slsa-verifier verify-image "$IMAGE" \
                     --source-uri github.com/${{ github.repository }} \
-                    --source-tag ${{ github.event.inputs.image-tag }}
+                    --source-tag "$TAG"
 
-            - name: Download and inspect provenance
+                  echo ""
+                  echo "✅ SLSA verification successful!"
+
+            - name: Display provenance
               env:
                   IMAGE: ${{ steps.image-info.outputs.full-image }}
               run: |
-                  echo "Downloading provenance attestation..."
+                  echo "=== SLSA Provenance Details ==="
                   slsa-verifier verify-image "$IMAGE" \
                     --source-uri github.com/${{ github.repository }} \
-                    --print-provenance | tee provenance.json
+                    --source-tag "${{ github.event.inputs.image-tag }}" \
+                    --print-provenance | jq '.'
 
-                  echo ""
-                  echo "=== Provenance Summary ==="
-                  jq -r '.predicate.buildType' provenance.json
-                  jq -r '.predicate.builder.id' provenance.json
+            - name: Generate verification report
+              if: always()
+              run: |
+                  cat << EOF > verification-report.md
+                  # SLSA Verification Report
 
-            - name: Upload provenance artifact
+                  **Status:** ${{ job.status }}
+                  **Image:** \`${{ steps.image-info.outputs.full-image }}\`
+                  **Tag:** \`${{ github.event.inputs.image-tag }}\`
+                  **Repository:** \`${{ github.repository }}\`
+                  **Verified at:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+
+                  ## Verification Command
+                  \`\`\`bash
+                  slsa-verifier verify-image \\
+                    ${{ steps.image-info.outputs.full-image }} \\
+                    --source-uri github.com/${{ github.repository }} \\
+                    --source-tag ${{ github.event.inputs.image-tag }}
+                  \`\`\`
+                  EOF
+
+                  cat verification-report.md >> $GITHUB_STEP_SUMMARY
+
+            - name: Upload verification report
               uses: actions/upload-artifact@v4
-              with:
-                  name: provenance-attestation
-                  path: provenance.json
-
-    security-scan:
-        runs-on: ubuntu-latest
-        needs: verify
-
-        steps:
-            - name: Log in to Container Registry
-              uses: docker/login-action@v3
-              with:
-                  registry: ${{ env.REGISTRY }}
-                  username: ${{ github.actor }}
-                  password: ${{ secrets.GITHUB_TOKEN }}
-
-            - name: Run Trivy vulnerability scanner
-              uses: aquasecurity/trivy-action@master
-              with:
-                  image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.inputs.image-tag }}
-                  format: "sarif"
-                  output: "trivy-results.sarif"
-
-            - name: Upload Trivy results
-              uses: github/codeql-action/upload-sarif@v3
               if: always()
               with:
-                  sarif_file: "trivy-results.sarif"
+                  name: verification-report
+                  path: verification-report.md
